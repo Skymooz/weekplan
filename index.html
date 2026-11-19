@@ -380,6 +380,12 @@ input[type=color]{padding:2px 4px;height:34px;cursor:pointer}
       style="width:100%;font-size:11px;padding:5px 8px">↓ Recevoir du cloud</button>
     <div style="font-size:10px;color:var(--faint);font-family:'DM Mono',monospace;
       margin-top:6px" id="sync-ts"></div>
+    <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+      <div style="font-size:9px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.12em;font-family:'DM Mono',monospace;margin-bottom:6px">🔔 Rappels</div>
+      <button id="notif-btn" onclick="toggleReminders()" class="btn btn-ghost" style="width:100%;font-size:11px;padding:5px 8px;margin-bottom:3px">🔔 Activer les rappels</button>
+      <button onclick="testNotif()" class="btn btn-ghost" style="width:100%;font-size:11px;padding:5px 8px">Tester une notification</button>
+      <div id="notif-status" style="font-size:10px;color:var(--faint);font-family:'DM Mono',monospace;margin-top:6px;line-height:1.5"></div>
+    </div>
     <button class="pwa-btn" id="pwa-btn" onclick="doPwaInstall()">📲 Installer sur cet appareil</button>
   </div>
   <div class="sb-footer">
@@ -1836,6 +1842,7 @@ async function fbPush(){
   try{
     const r=await fetch(fbPath(),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(fbPayload())});
     if(!r.ok) throw new Error('HTTP '+r.status);
+    try{ await fetch(fbPath().replace('/data.json','/agenda.json'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(buildAgenda())}); }catch(e){ console.warn('agenda',e); }
     syncStatus('on','En ligne ✓'); syncTs();
   }catch(e){ syncStatus('err','Erreur envoi'); console.warn('fbPush',e); }
 }
@@ -1970,6 +1977,108 @@ function doPwaInstall(){
   _pwaEvt.prompt();
   _pwaEvt.userChoice.then(r=>{ if(r.outcome==='accepted') toast('📲 Installation…'); _pwaEvt=null; });
 }
+
+// ════════════════════════════════════════════
+// RAPPELS — notifications à l'heure d'une tâche
+// ════════════════════════════════════════════
+const NOTIF_ID_KEY='skymooz_push_id';
+const sanKey=k=>String(k).replace(/[.#$\[\]\/]/g,'_');
+function parseDM(s){ const m=String(s||'').match(/^\s*(\d{1,2})\s*[\/.\-]\s*(\d{1,2})/); return m?{d:+m[1],m:+m[2]}:null; }
+
+// Liste compacte : tâches non faites ayant une heure et une date. Envoyée à Firebase ; lue chaque minute par le serveur.
+function buildAgenda(){
+  const out=[]; const now=Date.now();
+  Object.entries(APP.weeks||{}).forEach(([wid,w])=>{
+    if(!w||!w.days) return;
+    if(w.createdAt && now-new Date(w.createdAt)>120*864e5) return;
+    w.days.forEach((day,di)=>{
+      const p=parseDM(day&&day.date); if(!p) return;
+      const dm=String(p.d).padStart(2,'0')+'/'+String(p.m).padStart(2,'0');
+      ((w.tasks&&w.tasks[di])||[]).forEach((t,ti)=>{
+        if(!t||t.done||!/^\d{1,2}:\d{2}$/.test(t.time||'')) return;
+        out.push({k:wid+'_'+di+'_'+ti, dm, t:t.time, n:t.name, x:t.detail||''});
+      });
+    });
+  });
+  return out;
+}
+function reminderDue(now){
+  const d=now.getDate(), mo=now.getMonth()+1, mins=now.getHours()*60+now.getMinutes();
+  const ymd=now.getFullYear()*10000+mo*100+d; const out=[];
+  buildAgenda().forEach(a=>{
+    const p=parseDM(a.dm); if(!p||p.d!==d||p.m!==mo) return;
+    const [h,mi]=a.t.split(':').map(Number); const diff=mins-(h*60+mi);
+    if(diff>=0&&diff<=5) out.push({key:sanKey(a.k+'_'+ymd),time:a.t,body:a.n+(a.x?' · '+a.x:'')});
+  });
+  return out;
+}
+function reminderSupport(){ return ('Notification' in window)&&('serviceWorker' in navigator)&&('PushManager' in window); }
+
+// Filet de sécurité quand l'appli est ouverte : même "tag" que la notification du serveur → pas de doublon sur l'appareil
+async function reminderTick(){
+  if(!('Notification' in window)||Notification.permission!=='granted'||!('serviceWorker' in navigator)) return;
+  const due=reminderDue(new Date()); if(!due.length) return;
+  let seen={}; try{ seen=JSON.parse(localStorage.getItem('skymooz_notified')||'{}'); }catch(e){}
+  const fresh=due.filter(x=>!seen[x.key]); if(!fresh.length) return;
+  const reg=await navigator.serviceWorker.ready;
+  for(const x of fresh){
+    seen[x.key]=Date.now();
+    await reg.showNotification('⏰ '+x.time+' — WeekPlan',{body:x.body,icon:'icons/icon-192.png',badge:'icons/badge-96.png',tag:'wp-'+x.key,data:{url:'./'}});
+  }
+  Object.keys(seen).forEach(k=>{ if(Date.now()-seen[k]>3*864e5) delete seen[k]; });
+  try{ localStorage.setItem('skymooz_notified',JSON.stringify(seen)); }catch(e){}
+}
+
+function fnv(s){ let h=0x811c9dc5; for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,0x01000193)>>>0; } return h; }
+function pushId(ep){ return 'd'+fnv(ep).toString(36)+fnv(ep.split('').reverse().join('')).toString(36); }
+function b64uToU8(s){ const p='='.repeat((4-s.length%4)%4); const r=atob((s+p).replace(/-/g,'+').replace(/_/g,'/')); return Uint8Array.from(r,c=>c.charCodeAt(0)); }
+function deviceLabel(){ const u=navigator.userAgent; return /Android/.test(u)?(/Mobile/.test(u)?'Téléphone Android':'Tablette Android'):/Windows/.test(u)?'PC Windows':/Mac/.test(u)?'Mac':'Autre appareil'; }
+function pushUrl(id){ return FB.url.replace(/\/+$/,'')+'/wp/'+FB.uid+'/push/'+id+'.json'; }
+
+function refreshNotifUI(){
+  const btn=document.getElementById('notif-btn'), st=document.getElementById('notif-status'); if(!btn||!st) return;
+  if(!reminderSupport()){ btn.disabled=true; st.textContent='Non disponible ici : ouvre l’appli installée depuis Chrome'; return; }
+  const perm=Notification.permission, on=!!localStorage.getItem(NOTIF_ID_KEY)&&perm==='granted';
+  btn.textContent=on?'🔕 Désactiver les rappels':'🔔 Activer les rappels';
+  st.textContent=perm==='denied'?'Bloquées : autorise-les dans Chrome (cadenas → Notifications)':on?'Rappels actifs sur cet appareil ✓':'Rappels désactivés';
+}
+async function toggleReminders(){ return localStorage.getItem(NOTIF_ID_KEY)?disableReminders():enableReminders(); }
+
+async function enableReminders(){
+  if(!reminderSupport()){ toast('⚠️ Notifications non supportées ici'); return; }
+  if(!FB.on){ toast('⚠️ Connecte d’abord la synchronisation Firebase'); openFbModal(); return; }
+  const perm=await Notification.requestPermission();
+  if(perm!=='granted'){ toast('⚠️ Notifications refusées'); refreshNotifUI(); return; }
+  try{
+    const reg=await navigator.serviceWorker.ready;
+    const kr=await fetch('api/vapid'); if(!kr.ok) throw new Error('serveur de rappels introuvable (HTTP '+kr.status+')');
+    const {publicKey}=await kr.json();
+    let sub=await reg.pushManager.getSubscription();
+    if(!sub) sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64uToU8(publicKey)});
+    const id=pushId(sub.endpoint);
+    const r=await fetch(pushUrl(id),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sub:sub.toJSON(),label:deviceLabel(),ts:Date.now()})});
+    if(!r.ok) throw new Error('Firebase HTTP '+r.status);
+    localStorage.setItem(NOTIF_ID_KEY,id);
+    fbPush(); // publie aussi l'agenda
+    toast('🔔 Rappels activés sur cet appareil');
+  }catch(e){ toast('⚠️ '+e.message); }
+  refreshNotifUI();
+}
+async function disableReminders(){
+  try{
+    const reg=await navigator.serviceWorker.ready, sub=await reg.pushManager.getSubscription(), id=localStorage.getItem(NOTIF_ID_KEY);
+    if(FB.on&&FB.url&&id) await fetch(pushUrl(id),{method:'DELETE'});
+    if(sub) await sub.unsubscribe();
+  }catch(e){}
+  localStorage.removeItem(NOTIF_ID_KEY); toast('🔕 Rappels désactivés'); refreshNotifUI();
+}
+async function testNotif(){
+  if(!('Notification' in window)||Notification.permission!=='granted'){ toast('Active d’abord les rappels'); return; }
+  const reg=await navigator.serviceWorker.ready;
+  reg.showNotification('WeekPlan · test',{body:'Les notifications fonctionnent sur cet appareil ✓',icon:'icons/icon-192.png',badge:'icons/badge-96.png',tag:'weekplan-test'});
+}
+setInterval(reminderTick,20000);
+setTimeout(()=>{ refreshNotifUI(); reminderTick(); },2500);
 
 if('serviceWorker' in navigator && location.protocol.indexOf('http')===0){
   window.addEventListener('load',()=>{ navigator.serviceWorker.register('sw.js').catch(()=>{}); });
